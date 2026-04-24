@@ -1,11 +1,8 @@
 {
-  "name": "mc-afk-dashboard",
-  "version": "2.0.0",
-  "description": "Minecraft AFK Bot with Web Dashboard",
+  "name": "mc-afk-bot",
+  "version": "3.0.0",
   "main": "index.js",
-  "scripts": {
-    "start": "node index.js"
-  },
+  "scripts": { "start": "node index.js" },
   "dependencies": {
     "mineflayer": "^4.23.0",
     "express": "^4.18.2",
