@@ -114,7 +114,7 @@ function scheduleReconnect() {
   }, delay * 1000);
 }
 
-function startBot() {
+async function startBot() {
   if (bot) stopBot('restart', true);
   isStopping = false;
 
@@ -123,7 +123,13 @@ function startBot() {
     return;
   }
 
+  // ── Pre-connect delay (simulasi loading screen player asli) ──
+  const preDelay = randInt(3000, 7000);
+  addLog(`⏳ Pre-connect delay ${Math.round(preDelay/1000)}s (simulasi player asli)...`, 'info');
   setStatus('connecting');
+  await sleep(preDelay);
+  if (isStopping) return;
+
   addLog(`🔌 Connecting ke ${STATE.config.host}:${STATE.config.port} sebagai ${STATE.config.username}...`);
 
   try {
@@ -133,7 +139,9 @@ function startBot() {
       username: STATE.config.username,
       version: STATE.config.version,
       auth: STATE.config.auth,
-      hideErrors: false
+      hideErrors: false,
+      physicsEnabled: false,        // KUNCI: matikan physics engine Mineflayer
+      checkTimeoutInterval: 30000   // timeout lebih longgar
     });
   } catch (err) {
     addLog(`❌ Gagal buat bot: ${err.message}`, 'error');
@@ -142,8 +150,7 @@ function startBot() {
     return;
   }
 
-  // ── Spoof client brand: "mineflayer" → "vanilla" ──────────
-  // Anti-bot plugin sering cek brand string ini
+  // ── Spoof brand di level packet write ─────────────────────
   try {
     const origWrite = bot._client.write.bind(bot._client);
     bot._client.write = function(name, params) {
@@ -154,20 +161,56 @@ function startBot() {
       }
       return origWrite(name, params);
     };
-    addLog('🎭 Brand spoof aktif (vanilla)', 'info');
+    addLog('🎭 Brand spoof: vanilla', 'info');
   } catch (e) {
     addLog('Brand spoof gagal: ' + e.message, 'warn');
   }
 
-  // Intercept login packet untuk spoof lebih lanjut
-  bot._client.on('login', () => {
-    // Kirim brand vanilla manual
+  // ── Intercept kick dini ───────────────────────────────────
+  bot._client.on('kick_disconnect', (packet) => {
+    addLog(`⚡ Kick packet dini: ${JSON.stringify(packet.reason)}`, 'error');
+  });
+
+  // ── Saat login state: kirim packet dalam urutan VANILLA ───
+  // Vanilla order: client_information → minecraft:register → minecraft:brand
+  bot._client.on('login', async () => {
+    await sleep(randInt(300, 700));
+
+    // 1. client_information DULU (vanilla kirim ini sebelum brand)
+    try {
+      bot._client.write('settings', {
+        locale: 'en_US',
+        viewDistance: 10,
+        chatFlags: 0,
+        chatColors: true,
+        skinParts: 127,
+        mainHand: 1,
+        enableTextFiltering: false,
+        enableServerListing: true
+      });
+    } catch(_) {}
+
+    await sleep(randInt(100, 300));
+
+    // 2. minecraft:register (vanilla selalu kirim ini, Mineflayer tidak)
+    try {
+      bot._client.write('plugin_message', {
+        channel: 'minecraft:register',
+        data: Buffer.from('minecraft:brand')
+      });
+    } catch(_) {}
+
+    await sleep(randInt(100, 200));
+
+    // 3. minecraft:brand terakhir
     try {
       bot._client.write('plugin_message', {
         channel: 'minecraft:brand',
         data: Buffer.from('\x07vanilla')
       });
     } catch(_) {}
+
+    addLog('📦 Packet login vanilla terkirim (info→register→brand)', 'info');
   });
 
   bot.once('spawn', async () => {
@@ -175,19 +218,21 @@ function startBot() {
     reconnectCount = 0;
     addLog(`✅ Spawn berhasil di ${STATE.config.host}`, 'success');
 
-    // Kirim client settings mirip player asli
+    // Tunggu sebentar (player asli juga butuh waktu load chunk)
+    await sleep(randInt(1000, 2500));
+
+    // Kirim position awal — vanilla selalu kirim ini sesaat setelah spawn
     try {
-      bot._client.write('settings', {
-        locale: 'en_US',
-        viewDistance: 10,
-        chatFlags: 0,
-        chatColors: true,
-        skinParts: 127,   // semua skin part aktif
-        mainHand: 1,
-        enableTextFiltering: false,
-        enableServerListing: true
-      });
-      addLog('⚙️ Client settings terkirim', 'info');
+      if (bot.entity) {
+        bot._client.write('position', {
+          x: bot.entity.position.x,
+          y: bot.entity.position.y,
+          z: bot.entity.position.z,
+          yaw: 0,
+          pitch: 0,
+          onGround: true
+        });
+      }
     } catch(_) {}
 
     // Tunggu lebih lama sebelum /login agar server tidak curiga
@@ -205,6 +250,8 @@ function startBot() {
       }
     }
 
+    // Kirim position packet berkala (simulasi vanilla client idle)
+    startPositionKeepAlive();
     startAntiAfk();
   });
 
@@ -243,10 +290,26 @@ function startBot() {
     const r = typeof reason === 'object' ? JSON.stringify(reason) : String(reason);
     addLog(`❌ Kicked: ${r}`, 'error');
 
-    // Kalau kicked karena login terlalu cepat, tunggu lebih lama
-    if (r.toLowerCase().includes('too fast') || r.toLowerCase().includes('too many')) {
-      addLog('⏳ Server rate-limit login. Reconnect lebih lama...', 'warn');
-      reconnectCount = Math.min(reconnectCount + 2, BACKOFF_DELAYS.length - 1); // paksa delay lebih panjang
+    const rLow = r.toLowerCase();
+
+    // Kalau server detect bot → jangan spam reconnect, tunggu sangat lama
+    if (rLow.includes('bot terdeteksi') || rLow.includes('bot detected') || rLow.includes('detected')) {
+      addLog('🤖 Server mendeteksi bot! Tunggu 3 menit sebelum coba lagi...', 'error');
+      addLog('💡 Tips: Coba ganti username di Settings, atau buka tiket ke admin server.', 'warn');
+      reconnectCount = BACKOFF_DELAYS.length - 1; // langsung ke delay maksimal (120s)
+      // Tambah delay ekstra 3 menit di atas backoff normal
+      bot = null;
+      setStatus('offline');
+      const extraDelay = 180000 + randInt(0, 60000); // 3-4 menit
+      addLog(`⏳ Extra delay ${Math.round(extraDelay/1000)}s karena deteksi bot...`, 'warn');
+      setTimeout(() => scheduleReconnect(), extraDelay - (BACKOFF_DELAYS[BACKOFF_DELAYS.length-1] * 1000));
+      return;
+    }
+
+    // Rate limit login
+    if (rLow.includes('too fast') || rLow.includes('too many')) {
+      addLog('⏳ Rate-limit login, paksa delay lebih lama...', 'warn');
+      reconnectCount = Math.min(reconnectCount + 2, BACKOFF_DELAYS.length - 1);
     }
 
     bot = null;
@@ -291,29 +354,83 @@ async function startAntiAfk() {
           bot.setControlState(arah, false);
           break;
         case 3:
-          if (bot.look) await bot.look(randFloat(-Math.PI, Math.PI), randFloat(-0.4, 0.4), false);
-          await sleep(randInt(500, 1500));
+          // Gerak kepala smooth (bukan instant snap)
+          if (bot.entity) {
+            const targetYaw = randFloat(-Math.PI, Math.PI);
+            const targetPitch = randFloat(-0.3, 0.3);
+            const steps = randInt(5, 12);
+            const startYaw = bot.entity.yaw || 0;
+            const startPitch = bot.entity.pitch || 0;
+            for (let i = 1; i <= steps; i++) {
+              const yaw = startYaw + (targetYaw - startYaw) * (i / steps);
+              const pitch = startPitch + (targetPitch - startPitch) * (i / steps);
+              try { if (bot.look) await bot.look(yaw, pitch, false); } catch(_) {}
+              await sleep(randInt(60, 120));
+            }
+          }
+          await sleep(randInt(500, 2000));
           break;
         case 4:
-          bot.setControlState('jump', true);
-          await sleep(randInt(80, 200));
-          bot.setControlState('jump', false);
+          // Micro-movement packet (sangat kecil, tidak terlihat tapi ada di packet)
+          if (bot.entity) {
+            try {
+              const offsetX = (Math.random() - 0.5) * 0.04;
+              const offsetZ = (Math.random() - 0.5) * 0.04;
+              bot._client.write('position', {
+                x: bot.entity.position.x + offsetX,
+                y: bot.entity.position.y,
+                z: bot.entity.position.z + offsetZ,
+                yaw: bot.entity.yaw || 0,
+                pitch: bot.entity.pitch || 0,
+                onGround: true
+              });
+            } catch(_) {}
+          }
+          await sleep(randInt(200, 600));
           break;
         case 5:
+          // Sneak toggle
           bot.setControlState('sneak', true);
-          await sleep(randInt(600, 2000));
+          await sleep(randInt(400, 1200));
           bot.setControlState('sneak', false);
           break;
         case 6:
+          // Diam total
           break;
       }
-      const jeda = randInt(12000, 30000);
+      const jeda = randInt(15000, 35000);
       await sleep(jeda);
     } catch (err) {
       addLog('Anti-AFK error: ' + err.message, 'error');
       await sleep(5000);
     }
   }
+}
+
+// ── Position Keep-Alive (simulasi vanilla idle ~1 detik/packet) ──
+let posInterval = null;
+function startPositionKeepAlive() {
+  if (posInterval) { clearInterval(posInterval); posInterval = null; }
+  function sendPos() {
+    if (!bot || !bot.entity || STATE.status !== 'online') {
+      if (posInterval) { clearInterval(posInterval); posInterval = null; }
+      return;
+    }
+    try {
+      const jX = (Math.random() - 0.5) * 0.002;
+      const jZ = (Math.random() - 0.5) * 0.002;
+      bot._client.write('position', {
+        x: bot.entity.position.x + jX,
+        y: bot.entity.position.y,
+        z: bot.entity.position.z + jZ,
+        yaw: bot.entity.yaw || 0,
+        pitch: bot.entity.pitch || 0,
+        onGround: true
+      });
+    } catch(_) {}
+  }
+  posInterval = setInterval(sendPos, 950 + randInt(-50, 50));
+  addLog('📍 Position keep-alive aktif', 'info');
 }
 
 // ── WebSocket ─────────────────────────────────────────────────
